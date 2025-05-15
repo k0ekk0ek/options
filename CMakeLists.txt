@@ -8,3 +8,5 @@ project(options LANGUAGES C VERSION 0.1.0)
 
 set(CMAKE_C_STANDARD 99)
 set(CMAKE_MODULE_PATH ${CMAKE_CURRENT_SOURCE_DIR}/cmake/Modules)
+
+add_subdirectory(compat/regex)

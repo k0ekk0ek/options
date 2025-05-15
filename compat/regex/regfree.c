@@ -37,7 +37,7 @@
 #include <sys/types.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <regex.h>
+#include "regex.h"
 #include <limits.h>
 
 #include "utils.h"
@@ -66,4 +66,3 @@ regfree(regex_t *preg)
 	free(g->must);
 	free(g);
 }
-DEF_WEAK(regfree);
