@@ -1,0 +1,15 @@
+/*
+ * config.h.in -- configuration header template
+ *
+ * Copyright (c) 2025, Jeroen Koekkoek
+ *
+ * SPDX-License-Identifier: BSD-3-Clause
+ *
+ */
+#ifndef CONFIG_H
+#define CONFIG_H
+
+/* Define to 1 if you have the <regex.h> header file. */
+#cmakedefine HAVE_REGEX_H 1
+
+#endif // CONFIG_H

@@ -49,3 +49,10 @@ elseif(CMAKE_C_COMPILER_ID MATCHES "Clang")
 elseif(CMAKE_C_COMPILER_ID STREQUAL "MSVC")
   add_compile_options(/W3)
 endif()
+
+configure_file(src/config.h.in src/config.h)
+
+add_executable(options src/parse.c src/options.c)
+#if(NOT HAVE_REGEX_H)
+#  target_link_libraries(testregex PRIVATE regex)
+#endif()
