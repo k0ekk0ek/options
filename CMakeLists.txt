@@ -32,7 +32,8 @@ endif()
 if(CMAKE_C_COMPILER_ID MATCHES "GNU")
   add_compile_options(
     -Wall -Wextra -Wconversion -Wunused -Winfinite-recursion
-    -Wmissing-prototypes -Wstrict-prototypes -Wshadow)
+    -Wmissing-prototypes -Wstrict-prototypes -Wshadow -Wformat=2
+    -Wcast-align=strict -Wmissing-declarations -Wstrict-overflow=5)
   if(CMAKE_GENERATOR STREQUAL "Ninja")
     add_compile_options(-fdiagnostics-color=always)
   endif()
@@ -40,7 +41,8 @@ elseif(CMAKE_C_COMPILER_ID MATCHES "Clang")
   add_compile_options(
     -Wall -Wextra -Wconversion -Wunused -Winfinite-recursion -Wassign-enum
     -Wcomma -Wdocumentation -Wmissing-prototypes -Wstrict-prototypes
-    -Wconditional-unitialized -Wshadow)
+    -Wconditional-uninitialized -Wshadow -Wformat=2 -Wcast-align=strict
+    -Wmissing-declarations -Wstrict-overflow=5)
   if(CMAKE_GENERATOR STREQUAL "Ninja")
     add_compile_options(-Xclang -fcolor-diagnostics)
   endif()
