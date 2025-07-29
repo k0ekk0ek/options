@@ -12,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <inttypes.h>
+#include <string.h>
 
 #include "options.h"
 #include "regex.h"
@@ -24,10 +25,16 @@ struct option {
   /** Useful to support options that embed sequence numbers (or similar). Use
       extended regular expressions (available on all Unices, use compat on
       Windows) */
-  const char *pattern;
-  /** Regular expression used to match identifier */
-  regex_t regex;
-  option_t *options;
+  struct {
+    size_t length;
+    const char *data;
+  } pattern;
+  // Regular expression used to match identifier
+  //regex_t regex;
+  struct {
+    size_t length;
+    const option_t *data;
+  } options;
   // Custom quote character(?) Might be useful for regular expressions.
   //char quote;
   // Parse function to use, e.g. parse_integer or custom parser.
@@ -47,51 +54,71 @@ struct location {
 
 typedef struct token token_t;
 struct token {
-  /** Type of token. e.g., SPACE, IDENTIFIER, etc. */
+  /** Type of token. e.g., SPACE, IDENTIFIER, etc */
   int32_t code;
   location_t location;
-  const char *data;
+  /** Start of token (offset) relative to file buffer */
+  size_t offset;
+  /** Token length */
   size_t length;
+  /** Pointer to option if code is section, option or suboption */
+  const option_t *option;
 };
 
-// scope contains info specific to current scope.
 typedef struct scope scope_t;
 struct scope {
-  /** Parent scope (section or file) */
-  const scope_t *scope;
-  /** Indent of current scope */
-  const token_t *indent;
+  /** Enclosing scope (section or file) */
+  const scope_t *encloser;
+  /** Indent of scope (token index) */
+  uint32_t indent;
+  /** Corresponding section or option */
   const option_t *option;
-  char escaped;
 };
 
 typedef struct file file_t;
 struct file {
   file_t *includer;
-  /** Filename in "include:" directive. */
+  /** Filename in "include:" directive */
   char *file;
-  /** Absolute path. */
+  /** Absolute path */
   char *path;
   FILE *handle;
 
   position_t position;
-
-  /** Token stack. */
-  struct {
-    size_t bottom, top, size;
-    token_t *tokens;
-  } stack;
-
-  // x. Register latest indent (indent for next option) to make finding
-  //    appropriate scope more convenient.
-  // x. Register start of line (to filter scope or otherwise blank space).
-  // x. Keep state (per scope) to deny literals after suboptions etc.
 
   struct {
     size_t offset, length, size;
     union { const char *read; char *write; } data;
   } buffer;
 
+  /** Token stack. */
+  // FIXME: allocate extra token and reserve first to indicate no-indentation
+  struct {
+    size_t bottom, top, size;
+    token_t *data;
+  } tokens;
+
+  /** State (per scope) to deny literals after suboptions etc. */
+  // FIXME: more states are likely required
+  enum {
+    SCAN,
+    SCAN_LITERAL_OR_SUBOPTION,
+    SCAN_SUBOPTION
+  } state;
+
+  // FIXME: scope must be maintained per file to associate file scope directly
+  //        with a section. e.g.
+  //        zone:
+  //          include: zone.generic.conf
+
+  // Register latest indent (indent for next (sub)option) to make finding
+  // corresponding scope more convenient. Set by parser after newline.
+  size_t indent;
+
+  // Register start of line (to filter scope or otherwise blank space).
+  //bool start_of_line;
+  //bool escaped;
+  //bool end_of_file;
 };
 
 typedef struct parser parser_t;
@@ -163,7 +190,7 @@ static always_inline int32_t have_char(const char *start, const char *end)
 
 nodiscard nonnull_all
 static always_inline const char *scan_space(
-  maybe_unused const scope_t *scope, const char *start, const char *end)
+  maybe_unused parser_t *parser, maybe_unused const scope_t *scope, const char *start, const char *end)
 {
   for (; have_char(start, end) == SPACE; start++) ;
   return start;
@@ -171,7 +198,7 @@ static always_inline const char *scan_space(
 
 nodiscard nonnull_all
 static always_inline const char *scan_comment(
-  maybe_unused const scope_t *scope, const char *start, const char *end)
+  maybe_unused parser_t *parser, maybe_unused const scope_t *scope, const char *start, const char *end)
 {
   for (; have_char(start, end) > 0 && *start != '\n'; start++) ;
   return start;
@@ -179,7 +206,7 @@ static always_inline const char *scan_comment(
 
 nodiscard nonnull_all
 static always_inline const char *scan_identifier(
-  maybe_unused const scope_t *scope, const char *start, const char *end)
+  maybe_unused parser_t *parser, maybe_unused const scope_t *scope, const char *start, const char *end)
 {
   for (; have_char(start, end) == IDENTIFIER; start++) ;
   return start; // maybe ':' or '='
@@ -187,7 +214,7 @@ static always_inline const char *scan_identifier(
 
 nodiscard nonnull_all
 static always_inline const char *scan_literal(
-  maybe_unused const scope_t *scope, const char *start, const char *end)
+  maybe_unused parser_t *parser, maybe_unused const scope_t *scope, const char *start, const char *end)
 {
   for (; have_char(start, end) >= IDENTIFIER; start++) ;
   return start;
@@ -195,37 +222,111 @@ static always_inline const char *scan_literal(
 
 nodiscard nonnull_all
 static always_inline const char *scan_quoted_literal(
-  scope_t *scope, const char *start, const char *end)
+  parser_t *parser, maybe_unused const scope_t *scope, const char *start, const char *end)
 {
   assert(start < end);
-  start += scope->escaped != '\0';
+  start += parser->file->escaped != '\0';
 
-  for (; have_char(start, end) > 0 && (scope->escaped || *start != '\"'); start++)
-    scope->escaped = *start == '\\' && !scope->escaped;
+  for (; have_char(start, end) > 0 && (parser->file->escaped || *start != '\"'); start++)
+    parser->file->escaped = *start == '\\' && !parser->file->escaped;
 
-  assert(start == end || *start == '\"' || scope->escaped);
+  assert(start == end || *start == '\"' || parser->file->escaped);
   return start + (start < end);
 }
 
-#if 0
-static bool is_option(
-  const scope_t *scope, const char *start, const char *end)
+nodiscard nonnull((1,2))
+static always_inline bool matches(
+  const option_t *option, const char *identifier, size_t length)
 {
-  return false;
+  return option->pattern.length == length &&
+         memcmp(option->pattern.data, identifier, length) == 0;
 }
 
-static bool is_suboption(
-  const scope_t *scope, const char *start, const char *end)
+nodiscard nonnull((1,2))
+static const option_t *has_option(
+  const option_t *option, const char *identifier, size_t length)
 {
-  return false;
+  // options contain suboptions, sections contain options and/or sections
+  if (option->code != SECTION)
+    return NULL;
+  for (size_t i = 0; i < option->options.length; i++)
+    if (matches(&option->options.data[i], identifier, length))
+      return &option->options.data[i];
+  return NULL;
 }
-#endif
+
+nodiscard nonnull((1,2,3))
+static const option_t *is_option(
+  const parser_t *parser, const scope_t *scope,
+  const char *identifier, size_t length)
+{
+  if (parser->file->state != SCAN)
+    return NULL;
+
+  const char *data = parser->file->buffer.data.read;
+  const token_t *inner = &parser->file->tokens.data[parser->file->indent];
+  const token_t *outer;
+
+  // scope indentation is determined by first section/option
+  if (scope->encloser && !scope->indent) {
+    outer = &parser->file->tokens.data[scope->encloser->indent];
+    assert(outer->code == SPACE);
+    if (outer->length < inner->length)
+      return !memcmp(data+outer->length, data+inner->length, outer->length)
+        ? has_option(scope->option, identifier, length) : NULL;
+    scope = scope->encloser;
+  }
+
+  for (; scope->encloser; scope = scope->encloser) {
+    assert(scope->indent);
+    outer = &parser->file->tokens.data[scope->indent];
+    assert(outer->code == SPACE);
+    if (outer->length < inner->length)
+      return !memcmp(data+outer->length, data+inner->length, outer->length)
+        ? has_option(scope->option, identifier, length) : NULL;
+  }
+
+  assert(scope);
+  assert(!scope->encloser);
+  assert(!scope->indent);
+
+  outer = &parser->file->tokens.data[scope->indent];
+  assert(!outer->length);
+  return outer->length == 0 && inner->length == 0
+    ? has_option(scope->option, identifier, length) : NULL;
+}
+
+nodiscard nonnull((1,2))
+static always_inline const option_t *has_suboption(
+  const option_t *option, const char *identifier, size_t length)
+{
+  if (option->code != OPTION)
+    return NULL;
+  for (size_t i = 0; i < option->options.length; i++)
+    if (matches(&option->options.data[i], identifier, length))
+      return &option->options.data[i];
+  return NULL;
+}
+
+nodiscard nonnull((1,2,3))
+static const option_t *is_suboption(
+  const parser_t *parser, const scope_t *scope,
+  const char *identifier, size_t length)
+{
+  if (parser->file->state != SCAN_LITERAL_OR_SUBOPTION &&
+      parser->file->state != SCAN_SUBOPTION)
+    return NULL;
+
+  // FIXME: incorrect, must be properly enclosed if on different line
+  return has_suboption(scope->option, identifier, length);
+}
 
 nonnull_all
 static int32_t scan(
   parser_t *parser, scope_t *scope, token_t *token)
 {
   const char *start, *end, *bound;
+  const option_t *option = NULL;
 
   start = end = parser->file->buffer.data.read + parser->file->buffer.offset;
   bound = parser->file->buffer.data.read + parser->file->buffer.length;
@@ -253,50 +354,87 @@ static int32_t scan(
 
     switch (code) {
       case SPACE:
-        end = scan_space(scope, end, bound);
+        end = scan_space(parser, scope, end, bound);
         break;
       case COMMENT:
-        end = scan_comment(scope, end, bound);
+        end = scan_comment(parser, scope, end, bound);
         break;
       case LINE_FEED:
+        // FIXE: do not loop if end == bound
         end++;
         break;
       case QUOTED_LITERAL:
-        end = scan_quoted_literal(scope, end, bound);
+        end = scan_quoted_literal(parser, scope, end, bound);
         break;
       case IDENTIFIER:
-        end = scan_identifier(scope, end, bound);
+        end = scan_identifier(parser, scope, end, bound);
         assert(end <= bound);
-        if (end == bound)
+        if (end == bound) {
+          // FIXME: actually conditional
+          code = LITERAL;
           break;
-        // x. Check if identifier is option if end points to ':' or
-        //    suboption if end points to '='.
+        }
+        if (*end == ':' && (option = is_option(parser, scope, start, (size_t)(end - start)))) {
+          end++;
+          break;
+        }
+        if (*end == '=' && (option = is_suboption(parser, scope, start, (size_t)(end - start)))) {
+          end++;
+          break;
+        }
         code = LITERAL;
-        /* fall through */
+        // fall through
       default:
         assert(code == LITERAL);
-        end = scan_literal(scope, end, bound);
+        end = scan_literal(parser, scope, end, bound);
         break;
     }
   } while (end == bound);
 
-tmp_eof_handler:
+end_of_file:
 
   assert(code >= 0);
   assert(start <= end);
 
   token->code = code;
-  token->data = start;
+  token->offset = (size_t)(start - parser->file->buffer.data.read);
   token->length = (uintptr_t)end - (uintptr_t)start;
+  token->option = option;
   assert((token->code == END_OF_FILE) == (token->length == 0));
   parser->file->buffer.offset += token->length;
 
   return token->code;
 }
 
+#define X_SUBOPTION(pattern_) \
+  { SUBOPTION, { sizeof(pattern_) - 1, pattern_ }, 0, { 0, NULL } }
+
+#define NO_SUBOPTIONS() { 0, NULL }
+#define SUBOPTIONS(suboptions_) { sizeof(suboptions_)/sizeof(suboptions_[0]), suboptions_ }
+
+// FIXME: introduce specialized options like INTEGER, STRING, etc?
+#define X_OPTION(pattern_, suboptions_) \
+  { OPTION, { sizeof(pattern_) - 1, pattern_ }, suboptions_ }
+
+#define NO_OPTIONS() { 0, NULL }
+#define OPTIONS(options_) { sizeof(options_)/sizeof(options_[0]), options_ }
+
+#define X_SECTION(pattern_, options_) \
+  { SECTION, { sizeof(pattern_) - 1, pattern_ }, options_ }
+
+static const option_t options[] = {
+  X_OPTION("foo", NO_SUBOPTIONS()),
+  X_OPTION("bar", NO_SUBOPTIONS())
+};
+
+static const option_t section[] = {
+  X_SECTION("not-a-pattern", OPTIONS(options))
+};
+
 int32_t parse_options(const char *str, size_t len)
 {
   parser_t parser = { 0 };
+  token_t indent = { SPACE, { { 1, 1 }, { 1, 1 } }, 0, 0, NULL };
 
   parser.first.buffer.data.read = str;
   parser.first.buffer.length = parser.first.buffer.size = len;
@@ -305,13 +443,26 @@ int32_t parse_options(const char *str, size_t len)
   parser.first.position.line = 1;
   parser.first.position.column = 1;
 
+  parser.first.tokens.bottom = 0;
+  parser.first.tokens.top = 1;
+  parser.first.tokens.size = 1;
+  parser.first.tokens.data = &indent;
+
   parser.file = &parser.first;
 
   int32_t code;
   token_t token = { 0 };
-  scope_t scope = { 0 };
+  scope_t scope = { NULL, 0, section };
+
+  // FIXME: parser must check for correct indentation
   while ((code = scan(&parser, &scope, &token)) > 0) {
-    printf("token { code = %" PRIu32 ", '%.*s' }\n", token.code, token.length, token.data);
+    const int length = (int)token.length;
+    const char *data = &parser->file->buffer.data.read[token.offset];
+    printf("token { code = %" PRIu32 ", '%.*s' }", token.code, length, data);
+    if (token.code & IDENTIFIER)
+      printf(" (matched option '%s')\n", token.option->pattern.data);
+    else
+      printf("\n");
   }
 
   printf("code at end: %" PRIu32 "\n", code);

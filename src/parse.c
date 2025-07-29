@@ -13,7 +13,7 @@
 
 int main(void)
 {
-  const char str[] = "foo \"foo bar\" bar baz";
+  const char str[] = "foo \"foo bar\" bar: baz";
   int32_t code = parse_options(str, sizeof(str) - 1);
   printf("code(main): %d\n", code);
   return 0;
