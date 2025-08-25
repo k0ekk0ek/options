@@ -12,6 +12,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "errors.h"
 
 typedef struct position position_t;
 struct position {
@@ -98,9 +99,6 @@ struct option {
 //   option: value
 //
 
-// error codes
-#define SYNTAX_ERROR (-1)
-#define OUT_OF_MEMORY (-2)
 
 int32_t parse_options_string(
   const option_tuple_t *options,
