@@ -52,7 +52,7 @@ endif()
 
 configure_file(src/config.h.in src/config.h)
 
-add_executable(options src/parse.c src/options.c)
+add_executable(options src/parse.c src/options.c src/findfirst.c)
 #if(NOT HAVE_REGEX_H)
 #  target_link_libraries(testregex PRIVATE regex)
 #endif()

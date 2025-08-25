@@ -16,11 +16,18 @@ static const option_t options[] = {
   OPTION("bar", NO_SUBOPTIONS)
 };
 
+static const option_t section[] = {
+  SECTION("baz", OPTIONS(options))
+};
+
 int main(void)
 {
-  const char str[] = "foo: \"foo bar\"\nbar: baz";
-  int32_t code = parse_options_string(
-    &OPTIONS(options), str, sizeof(str) - 1, NULL);
+  const char str[] =
+  "baz:\n"
+  "  foo: \"foo bar\"\n"
+  "  bar: baz";
+  int32_t code = parse_options(
+    section, 1, str, sizeof(str) - 1, NULL);
   printf("return code: %d\n", code);
   return 0;
 }

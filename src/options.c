@@ -13,6 +13,8 @@
 #include <stdlib.h>
 #include <inttypes.h>
 #include <string.h>
+#include <stdarg.h>
+#include <errno.h>
 
 #include "options.h"
 
@@ -22,6 +24,7 @@
 
 #include "regex.h"
 #include "macros.h"
+#include "findfirst.h"
 
 typedef struct token token_t;
 struct token {
@@ -30,9 +33,9 @@ struct token {
   /** Location of token */
   location_t location;
   /** Start of token (offset) relative to file buffer */
-  size_t offset;
-  /** Token length */
-  size_t length;
+  size_t first;
+  /** Size of token */
+  size_t size;
   /** Pointer to option if code is section, option or suboption */
   const option_t *option;
 };
@@ -58,26 +61,24 @@ struct file {
   char *name;
   /** Absolute path */
   char *path;
+  /** File handle */
   FILE *handle;
 
-  position_t position;
+  location_t location;
 
   struct {
-    size_t offset, size, capacity;
-    union { const char *read; char *write; } data;
+    size_t first, size, capacity;
+    char *data;
   } buffer;
 
-  /** Token stack (first reserved for no-indentation) */
+  /** Token stack (first reserved for "no-indentation") */
   struct {
-    size_t offset, size, capacity;
+    size_t last, size, capacity;
     token_t *data;
   } tokens;
 
-  // Register latest indent (indent for next (sub)option) to make finding
-  // corresponding scope more convenient. Set by parser after newline.
+  /** Latest file indentation */
   size_t indent;
-  // Register start of line (to filter scope or otherwise blank space).
-  size_t escape;
 };
 
 typedef struct parser parser_t;
@@ -140,88 +141,147 @@ static const int8_t table[256] = {
    8,  8,  8,  8,  8,  8,  8,  8     // 0xf8 - 0xff
 };
 
+
+static const option_t include =
+  { INCLUDE, { 7, "include" }, { 0, NULL }, 0, 0, 0 };
+
 nodiscard nonnull_all
-static always_inline int32_t have_char(const char *start, const char *end)
+static int32_t syntax_error(
+  maybe_unused const parser_t *parser, maybe_unused const scope_t *scope,
+  const location_t *location, const char *format, ...)
 {
-  return start < end ? table[(uint8_t)*start] : 0;
+  va_list ap;
+  va_start(ap, format);
+  fprintf(stderr, "%s:%zu:%zu: ", location->file, location->line, location->column);
+  vfprintf(stderr, format, ap);
+  fprintf(stderr, "\n");
+  va_end(ap);
+  return SYNTAX_ERROR;
 }
 
 nodiscard nonnull_all
-static always_inline const char *scan_space(
-  maybe_unused parser_t *parser, maybe_unused const scope_t *scope, const char *start, const char *end)
+static int32_t semantic_error(
+  maybe_unused const parser_t *parser, maybe_unused const scope_t *scope,
+  const location_t *location, const char *format, ...)
 {
-  for (; have_char(start, end) == SPACE; start++) ;
-  return start;
+  va_list ap;
+  va_start(ap, format);
+  fprintf(stderr, "%s:%zu:%zu: ", location->file, location->line, location->column);
+  vfprintf(stderr, format, ap);
+  fprintf(stderr, "\n");
+  va_end(ap);
+  return SEMANTIC_ERROR;
+}
+
+nodiscard nonnull((1))
+static always_inline int32_t have_char(const parser_t *parser, size_t first)
+{
+  return first < parser->file->buffer.size
+    ? table[(uint8_t)parser->file->buffer.data[first]] : 0;
+}
+
+nodiscard nonnull((1))
+static always_inline size_t scan_space(const parser_t *parser, size_t first)
+{
+  for (; have_char(parser, first) == SPACE; first++) ;
+  return first;
 }
 
 nodiscard nonnull_all
-static always_inline const char *scan_comment(
-  maybe_unused parser_t *parser, maybe_unused const scope_t *scope, const char *start, const char *end)
+static always_inline size_t scan_comment(const parser_t *parser, size_t first)
 {
-  for (; have_char(start, end) > 0 && *start != '\n'; start++) ;
-  return start;
+  for (; have_char(parser, first) > 0 &&
+         parser->file->buffer.data[first] != '\n'; first++)
+    ;
+  return first;
 }
 
 nodiscard nonnull_all
-static always_inline const char *scan_identifier(
-  maybe_unused parser_t *parser, maybe_unused const scope_t *scope, const char *start, const char *end)
+static always_inline size_t scan_identifier(const parser_t *parser, size_t first)
 {
-  for (; have_char(start, end) == OPTION; start++) ;
-  return start; // maybe ':' or '='
+  for (; have_char(parser, first) == OPTION; first++) ;
+  return first; // maybe ':' or '='
 }
 
 nodiscard nonnull_all
-static always_inline const char *scan_literal(
-  maybe_unused parser_t *parser, maybe_unused const scope_t *scope, const char *start, const char *end)
+static always_inline size_t scan_value(const parser_t *parser, size_t first)
 {
-  for (; have_char(start, end) >= OPTION; start++) ;
-  return start;
+  for (; have_char(parser, first) >= OPTION &&
+         parser->file->buffer.data[first] != '\"'; first++)
+    ;
+  return first;
 }
 
-nodiscard nonnull_all
-static always_inline const char *scan_quoted_literal(
-  parser_t *parser, maybe_unused const scope_t *scope, const char *start, const char *end)
+nodiscard nonnull((1,2))
+static bool is_indent(
+  const parser_t *parser, const scope_t *scope, size_t indent)
 {
-  assert(start < end);
-  start += parser->file->escape != '\0';
+  const token_t *encloser = &parser->file->tokens.data[scope->indent];
+  const token_t *enclosed = &parser->file->tokens.data[indent];
+  const char *data = parser->file->buffer.data;
 
-  for (; have_char(start, end) > 0 && (parser->file->escape || *start != '\"'); start++)
-    parser->file->escape = *start == '\\' && !parser->file->escape;
+  size_t size = encloser->size;
+  if (encloser->size < enclosed->size)
+    size = enclosed->size;
+  return memcmp(data+encloser->first, data+enclosed->first, size) == 0;
+}
 
-  assert(start == end || *start == '\"' || parser->file->escape);
-  return start + (start < end);
+nodiscard nonnull((1,2))
+static int32_t in_scope(
+  const parser_t *parser, const scope_t *scope, size_t indent)
+{
+  const token_t *encloser = &parser->file->tokens.data[scope->indent];
+  const token_t *enclosed = &parser->file->tokens.data[indent];
+
+  if (encloser->size > enclosed->size)
+    return  1;
+  if (encloser->size < enclosed->size)
+    return -1;
+  return 0;
 }
 
 nodiscard nonnull((1,2))
 static always_inline bool matches(
-  const option_t *option, const char *identifier, size_t length)
+  const option_t *option, const char *name, size_t size)
 {
-  return option->pattern.length == length &&
-         memcmp(option->pattern.data, identifier, length) == 0;
+  return option->pattern.size == size &&
+         memcmp(option->pattern.data, name, size) == 0;
+}
+
+nodiscard nonnull((1,2,4))
+static const option_t *is_include(
+  maybe_unused const parser_t *parser, maybe_unused const scope_t *scope,
+  int32_t state, const char *name, size_t size)
+{
+  if (!(state & (1 << OPTION)))
+    return NULL;
+  if (!matches(&include, name, size))
+    return NULL;
+  return &include;
 }
 
 nodiscard nonnull((1,2))
 static const option_t *has_option(
-  const option_t *option, const char *identifier, size_t length)
+  const option_t *option, const char *name, size_t size)
 {
   // options contain suboptions, sections contain options and/or sections
   if (option->code != SECTION)
     return NULL;
   for (size_t i = 0; i < option->options.size; i++)
-    if (matches(&option->options.data[i], identifier, length))
+    if (matches(&option->options.data[i], name, size))
       return &option->options.data[i];
   return NULL;
 }
 
 nodiscard nonnull((1,2,4))
 static const option_t *is_option(
-  const parser_t *parser, const scope_t *scope, const int32_t state,
-  const char *identifier, size_t length)
+  const parser_t *parser, const scope_t *scope,
+  int32_t state, const char *name, size_t size)
 {
   if (!(state & (1 << OPTION)))
     return NULL;
 
-  const char *data = parser->file->buffer.data.read;
+  const char *data = parser->file->buffer.data;
   const token_t *inner = &parser->file->tokens.data[parser->file->indent];
   const token_t *outer;
 
@@ -229,9 +289,9 @@ static const option_t *is_option(
   if (scope->encloser && !scope->indent) {
     outer = &parser->file->tokens.data[scope->encloser->indent];
     assert(outer->code == SPACE);
-    if (outer->length < inner->length)
-      return !memcmp(data+outer->length, data+inner->length, outer->length)
-        ? has_option(scope->option, identifier, length) : NULL;
+    if (outer->size < inner->size)
+      return !memcmp(data+outer->size, data+inner->size, outer->size)
+        ? has_option(scope->option, name, size) : NULL;
     scope = scope->encloser;
   }
 
@@ -239,9 +299,9 @@ static const option_t *is_option(
     assert(scope->indent);
     outer = &parser->file->tokens.data[scope->indent];
     assert(outer->code == SPACE);
-    if (outer->length < inner->length)
-      return !memcmp(data+outer->length, data+inner->length, outer->length)
-        ? has_option(scope->option, identifier, length) : NULL;
+    if (outer->size < inner->size)
+      return !memcmp(data+outer->size, data+inner->size, outer->size)
+        ? has_option(scope->option, name, size) : NULL;
   }
 
   assert(scope);
@@ -249,128 +309,196 @@ static const option_t *is_option(
   assert(!scope->indent);
 
   outer = &parser->file->tokens.data[scope->indent];
-  assert(!outer->length);
-  return outer->length == 0 && inner->length == 0
-    ? has_option(scope->option, identifier, length) : NULL;
+  assert(!outer->size);
+  return outer->size == 0 && inner->size == 0
+    ? has_option(scope->option, name, size) : NULL;
 }
 
 nodiscard nonnull((1,2))
 static always_inline const option_t *has_suboption(
-  const option_t *option, const char *identifier, size_t length)
+  const option_t *option, const char *name, size_t size)
 {
   if (option->code != OPTION)
     return NULL;
   for (size_t i = 0; i < option->options.size; i++)
-    if (matches(&option->options.data[i], identifier, length))
+    if (matches(&option->options.data[i], name, size))
       return &option->options.data[i];
   return NULL;
 }
 
 nodiscard nonnull((1,2,4))
 static const option_t *is_suboption(
-  const parser_t *parser, const scope_t *scope, const int32_t state,
-  const char *identifier, size_t length)
+  const parser_t *parser, const scope_t *scope, int32_t state,
+  const char *name, size_t size)
 {
   (void)parser;
   if (!(state & (1 << SUBOPTION)))
     return NULL;
 
   // FIXME: incorrect, must be properly enclosed if on different line
-  return has_suboption(scope->option, identifier, length);
+  return has_suboption(scope->option, name, size);
 }
 
-nonnull_all
-static int32_t scan(
-  parser_t *parser, const scope_t *scope, const int32_t state, token_t *token)
+nodiscard nonnull_all
+static int32_t empty(const parser_t *parser)
 {
-  const char *start, *end, *bound;
-  const option_t *option = NULL;
+  return !parser->file->handle || feof(parser->file->handle) != 0;
+}
 
-  start = end = parser->file->buffer.data.read + parser->file->buffer.offset;
-  bound = parser->file->buffer.data.read + parser->file->buffer.size;
+nodiscard nonnull_all
+static int32_t refill(parser_t *parser, size_t *first, size_t *last)
+{
+  // implement
+  (void)parser;
+  (void)first;
+  (void)last;
+  return 0;
+}
 
-  int32_t code;
-  if (end == bound) {
-    // end-of-file, refill?
-    code = END_OF_FILE;
-    goto end_of_file; // temporary
-  }
-
-  if (*start == '\"')
-    code = QUOTED_VALUE;
-  else if (*start == '-') // identifiers cannot start with '-'
-    code = VALUE;
-  else if ((code = table[(uint8_t)*start]) < 0)
-    return -1;
-
-  end = start + 1;
-  do {
-    if (end == bound) {
-      // FIXME: end-of-file, refill?
-      break;
-    }
-
-    switch (code) {
-      case SPACE:
-        end = scan_space(parser, scope, end, bound);
-        break;
-      case COMMENT:
-        end = scan_comment(parser, scope, end, bound);
-        break;
-      case LINE_FEED:
-        // FIXME: do not loop if end == bound
-        break;
-      case QUOTED_VALUE:
-        end = scan_quoted_literal(parser, scope, end, bound);
-        break;
-      case OPTION:
-        end = scan_identifier(parser, scope, end, bound);
-        assert(end <= bound);
-        if (end == bound) {
-          // FIXME: actually conditional
-          code = VALUE;
-          break;
-        }
-        if (*end == ':' && (option = is_option(parser, scope, state, start, (size_t)(end - start)))) {
-          end++;
-          break;
-        }
-        if (*end == '=' && (option = is_suboption(parser, scope, state, start, (size_t)(end - start)))) {
-          end++;
-          break;
-        }
-        code = VALUE;
-        // fall through
-      default:
-        assert(code == VALUE);
-        end = scan_literal(parser, scope, end, bound);
-        break;
-    }
-  } while (end == bound);
-
-end_of_file:
-
-  assert(code >= 0);
-  assert(start <= end);
-
+nodiscard nonnull((1))
+static int32_t tokenize(
+  parser_t *parser, int32_t code, size_t first, size_t last,
+  const option_t *option)
+{
+  assert(last >= first);
+  const size_t size = last - first;
+  assert((code == END_OF_FILE) == (size == 0));
+  assert(parser->file->tokens.size < parser->file->tokens.capacity);
+  token_t *token = &parser->file->tokens.data[ parser->file->tokens.size++ ];
   token->code = code;
-  token->offset = (size_t)(start - parser->file->buffer.data.read);
-  token->length = (uintptr_t)end - (uintptr_t)start;
+  token->first = first;
+  token->size = size;
   token->option = option;
-  assert((token->code == END_OF_FILE) == (token->length == 0));
-  parser->file->buffer.offset += token->length;
+  parser->file->buffer.first += size;
+  token->location = parser->file->location;
+
+  if (code == LINE_FEED) {
+    assert(size == 1);
+    parser->file->location.line += 1;
+    parser->file->location.column = 1;
+  } else {
+    parser->file->location.column += size;
+  }
 
   return token->code;
 }
 
 nodiscard nonnull_all
-static never_inline int32_t shift(
-  parser_t *parser, const scope_t *scope, int32_t state, token_t **token)
+static int32_t scan_quoted_value(
+  parser_t *parser, const scope_t *scope)
 {
-  assert(parser->file->tokens.size > 0);
-  assert(parser->file->tokens.offset > 0);
+  size_t first, last;
 
-  if (parser->file->tokens.offset == parser->file->tokens.size) {
+  first = last = parser->file->buffer.first;
+  assert(parser->file->buffer.size >= last);
+  assert(parser->file->buffer.data[last] == '\"');
+
+  last++;
+  for (bool escaped = false;;) {
+    if (last == parser->file->buffer.size) {
+      int32_t code;
+      if ((code = refill(parser, &first, &last)) < 0)
+        return code;
+      if (last == parser->file->buffer.size)
+        return syntax_error(parser, scope, &parser->file->location,
+          "unterminated quoted value");
+    } else {
+      if (parser->file->buffer.data[last] == '\n')
+        return syntax_error(parser, scope, &parser->file->location,
+          "line feed in quoted value");
+      if (parser->file->buffer.data[last] == '\"' && !escaped)
+        break;
+      escaped = parser->file->buffer.data[last] == '\\' && !escaped;
+      last++;
+    }
+  }
+
+  assert(parser->file->buffer.size >= last);
+  assert(parser->file->buffer.data[last] == '\"');
+
+  return tokenize(parser, QUOTED_VALUE, first, last+1, NULL);
+}
+
+nodiscard nonnull_all
+static int32_t scan(
+  parser_t *parser, const scope_t *scope, const int32_t state)
+{
+  int32_t type;
+  size_t first, last;
+
+  first = last = parser->file->buffer.first;
+
+  if (last == parser->file->buffer.size) {
+    int32_t code;
+    if ((code = refill(parser, &first, &last)) < 0)
+      return code;
+    if (last == parser->file->buffer.size)
+      return tokenize(parser, END_OF_FILE, first, last, NULL);
+  }
+
+  assert(parser->file->buffer.size >= last);
+
+  if (parser->file->buffer.data[last] == '\"')
+    return scan_quoted_value(parser, scope);
+  if ((type = table[(uint8_t)parser->file->buffer.data[last]]) < 0)
+    return syntax_error(parser, scope, &parser->file->location,
+      "invalid character");
+
+  last++;
+  do {
+    if (last == parser->file->buffer.size) {
+      int32_t code;
+      if ((code = refill(parser, &first, &last)) < 0)
+        return code;
+      if (last == parser->file->buffer.size)
+        break;
+    }
+
+    if (type == SPACE) {
+      last = scan_space(parser, last);
+    } else if (type == COMMENT) {
+      last = scan_comment(parser, last);
+    } else if (type == LINE_FEED) {
+      break;
+    } else if (type == OPTION) {
+      last = scan_identifier(parser, last);
+      if (last == parser->file->buffer.size && !empty(parser))
+        continue;
+      if (last == parser->file->buffer.size)
+        return tokenize(parser, VALUE, first, last, NULL);
+
+      const char *end = parser->file->buffer.data + last;
+      const char *name = parser->file->buffer.data + first;
+      const size_t size = (size_t)(last - first);
+      const option_t *option;
+      if (*end == ':' && (option = is_include(parser, scope, state, name, size)))
+        return tokenize(parser, option->code, first, last+1, option);
+      if (*end == ':' && (option = is_option(parser, scope, state, name, size)))
+        return tokenize(parser, option->code, first, last+1, option);
+      if (*end == '=' && (option = is_suboption(parser, scope, state, name, size)))
+        return tokenize(parser, option->code, first, last+1, option);
+
+      type = VALUE;
+      last = scan_value(parser, last);
+    } else {
+      assert(type == VALUE);
+      last = scan_value(parser, last);
+    }
+  } while (last == parser->file->buffer.size);
+
+  assert(type >= 0);
+
+  return tokenize(parser, type, first, last, NULL);
+}
+
+nodiscard nonnull_all
+static never_inline int32_t shift(
+  parser_t *parser, const scope_t *scope, const int32_t state, token_t **token)
+{
+  assert(parser->file->tokens.last > 0);
+  assert(parser->file->tokens.size > 0);
+
+  if (parser->file->tokens.last == parser->file->tokens.size) {
     if (parser->file->tokens.size == parser->file->tokens.capacity) {
       if (SIZE_MAX - parser->file->tokens.capacity < 64)
         return OUT_OF_MEMORY;
@@ -382,72 +510,69 @@ static never_inline int32_t shift(
       parser->file->tokens.data = data;
     }
 
-    *token = &parser->file->tokens.data[ parser->file->tokens.size ];
-
-    if (scan(parser, scope, state, *token) < 0)
-      return OUT_OF_MEMORY;
-    parser->file->tokens.offset++;
-    parser->file->tokens.size++;
-    return (*token)->code;
+    int32_t code;
+    if ((code = scan(parser, scope, state)) < 0)
+      return code;
   }
 
-  *token = &parser->file->tokens.data[ parser->file->tokens.offset++ ];
+  assert(parser->file->tokens.last < parser->file->tokens.size);
+  *token = &parser->file->tokens.data[ parser->file->tokens.last++ ];
   return (*token)->code;
 }
 
 nonnull_all
 static never_inline void unshift(parser_t *parser)
 {
-  assert(parser->file->tokens.offset > 1);
-  assert(parser->file->tokens.offset <= parser->file->tokens.size);
-  parser->file->tokens.offset--;
+  assert(parser->file->tokens.last > 1);
+  assert(parser->file->tokens.last <= parser->file->tokens.size);
+  parser->file->tokens.last--;
 }
 
 nonnull_all
 static never_inline void reduce(parser_t *parser)
 {
-  assert(parser->file->tokens.offset > 1);
-  assert(parser->file->tokens.offset <= parser->file->tokens.size);
+  assert(parser->file->tokens.last > 1);
+  assert(parser->file->tokens.last <= parser->file->tokens.size);
 
   // retain unshifted tokens
-  const size_t move = parser->file->tokens.size - parser->file->tokens.offset;
+  const size_t move = parser->file->tokens.size - parser->file->tokens.last;
   memmove(
-    parser->file->tokens.data + (parser->file->tokens.offset - 1),
-    parser->file->tokens.data + (parser->file->tokens.offset),
+    parser->file->tokens.data + (parser->file->tokens.last - 1),
+    parser->file->tokens.data + (parser->file->tokens.last),
     move * sizeof(*parser->file->tokens.data));
 
-  parser->file->tokens.offset--;
+  parser->file->tokens.last--;
   parser->file->tokens.size--;
 }
 
 nodiscard nonnull_all
-static int32_t enter_scope(parser_t *parser, const scope_t *scope)
+static int32_t enter(const parser_t *parser, const scope_t *scope)
 {
   assert(scope->option);
   if (!scope->option->enter)
     return 0;
-  assert(scope->identifier < parser->file->tokens.offset);
+  assert(scope->identifier < parser->file->tokens.last);
   const token_t *token = &parser->file->tokens.data[scope->identifier];
   assert(token->code & OPTION);
-  assert(token->offset < parser->file->buffer.size);
-  const char *data = &parser->file->buffer.data.read[token->offset];
-  const lexeme_t lexeme = { token->location, { token->length, data } };
+  assert(token->first < parser->file->buffer.size);
+  const char *data = &parser->file->buffer.data[token->first];
+  const lexeme_t lexeme = { token->location, { token->size, data } };
   return scope->option->enter(scope->option, &lexeme, NULL);
 }
 
 nodiscard nonnull_all
-static int32_t exit_scope(parser_t *parser, const scope_t *scope)
+static int32_t leave(const parser_t *parser, const scope_t *scope)
 {
   assert(scope->option);
-  // FIXME: implement reducing scope indentation
+  // FIXME: reduce scope indentation
   if (!scope->option->exit)
     return 0;
-  assert(scope->identifier < parser->file->tokens.offset);
+  assert(scope->identifier < parser->file->tokens.last);
   const token_t *token = &parser->file->tokens.data[scope->identifier];
   assert(token->code & OPTION);
-  assert(token->offset < parser->file->buffer.size);
-  const char *data = &parser->file->buffer.data.read[token->offset];
-  const lexeme_t lexeme = { token->location, { token->length, data } };
+  assert(token->first < parser->file->buffer.size);
+  const char *data = &parser->file->buffer.data[token->first];
+  const lexeme_t lexeme = { token->location, { token->first, data } };
   return scope->option->exit(scope->option, &lexeme, NULL);
 }
 
@@ -460,49 +585,18 @@ static int32_t accept(
   (void)token;
   fprintf(stderr, "token: %s, value: '%.*s'\n",
     scope->option->pattern.data, // FIXME: option needs a name
-    (int)token->length,
-    &parser->file->buffer.data.read[token->offset]);
+    (int)token->size,
+    &parser->file->buffer.data[token->first]);
   return 0;
 }
 
-static always_inline bool in_options(
-  const option_t *section, const option_t *option)
-{
-  return option >= section->options.data &&
-         option <= section->options.data + section->options.size;
-}
-
-nodiscard nonnull((1,2))
-static bool in_scope(parser_t *parser, scope_t *scope, size_t indent)
-{
-  const char *data = parser->file->buffer.data.read;
-  const token_t *inner = &parser->file->tokens.data[indent];
-  const token_t *outer = &parser->file->tokens.data[scope->indent];
-
-  return inner->length == outer->length &&
-         memcmp(data+outer->offset, data+inner->offset, inner->length) == 0;
-}
-
 nodiscard nonnull_all
-static int32_t syntax_error(
-  const parser_t *parser, const scope_t *scope, const token_t *token,
-  const char *format)
+static int32_t parse_suboption(parser_t *parser, scope_t *scope)
 {
-  (void)parser;
-  (void)scope;
-  (void)token;
-  fprintf(stderr, "error: %s\n", format);
-  return SYNTAX_ERROR;
-}
-
-nodiscard nonnull_all
-static int32_t parse_suboption(parser_t *parser, const scope_t *scope)
-{
-  int32_t code;
-  const int32_t state = (1 << VALUE);
+  int32_t code, state = (1 << VALUE);
   token_t *token;
 
-  if ((code = enter_scope(parser, scope)) < 0)
+  if ((code = enter(parser, scope)) < 0)
     return code;
   if ((code = shift(parser, scope, state, &token)) < 0)
     return code;
@@ -515,7 +609,59 @@ static int32_t parse_suboption(parser_t *parser, const scope_t *scope)
       return code;
   }
 
-  return exit_scope(parser, scope);
+  return leave(parser, scope);
+}
+
+static int32_t include_filespec(
+  parser_t *parser, scope_t *scope, const char *filespec);
+
+static int32_t parse_include(parser_t *parser, scope_t *scope)
+{
+  int32_t code;
+  token_t *token;
+
+  if ((code = shift(parser, scope, 0, &token)) < 0)
+    return code;
+  // accept space between include: and file name
+  if (code == SPACE) {
+    reduce(parser);
+    if ((code = shift(parser, scope, 0, &token)) < 0)
+      return code;
+  }
+
+  if (code != VALUE && code != QUOTED_VALUE)
+    return semantic_error(parser, scope, &token->location,
+      "include: directive takes a file name");
+
+  const token_t *file = token;
+
+  // accept space and comment after file name
+  if ((code = shift(parser, scope, 0, &token)) < 0)
+    return code;
+  if (code == SPACE) {
+    reduce(parser);
+    if ((code = shift(parser, scope, 0, &token)) < 0)
+      return code;
+  }
+  if (code == COMMENT) {
+    reduce(parser);
+    if ((code = shift(parser, scope, 0, &token)) < 0)
+      return code;
+  }
+
+  if (code != LINE_FEED && code != END_OF_FILE)
+    return semantic_error(parser, scope, &token->location,
+      "include: directive takes only a file name");
+  else
+    unshift(parser);
+
+  char *filespec;
+  if (!(filespec = strndup(&parser->file->buffer.data[file->first], file->size)))
+    return OUT_OF_MEMORY;
+
+  code = include_filespec(parser, scope, filespec);
+  free(filespec);
+  return code;
 }
 
 static int32_t parse_option(parser_t *parser, scope_t *scope)
@@ -524,16 +670,16 @@ static int32_t parse_option(parser_t *parser, scope_t *scope)
   int32_t code, state = (1 << SUBOPTION) | (1 << VALUE);
   token_t *token;
 
-  if ((code = enter_scope(parser, scope)) < 0)
+  if ((code = enter(parser, scope)) < 0)
     return code;
 
   for (;;) {
     if ((code = shift(parser, scope, state, &token)) < 0)
       return code;
 
-    if (code == END_OF_FILE || code == OPTION || code == SECTION) {
+    if (code == END_OF_FILE || code == OPTION || code == SECTION || code == INCLUDE) {
       unshift(parser);
-      return exit_scope(parser, scope);
+      return leave(parser, scope);
     } else if (code == SPACE) {
       if (indent) {
         if (!scope->indent)
@@ -550,20 +696,26 @@ static int32_t parse_option(parser_t *parser, scope_t *scope)
       newline = true;
       parser->file->indent = 0;
     } else if (code == SUBOPTION) {
-      if (newline && !in_scope(parser, scope, parser->file->indent))
-        return syntax_error(parser, scope, token, "syntax error");
-      if (!in_options(scope->option, token->option))
-        return syntax_error(parser, scope, token, "syntax error");
-      const scope_t enclosed = { scope, 0, 0, token->option };
+      if (!scope->indent)
+        scope->indent = parser->file->indent;
+      if (newline && !is_indent(parser, scope, parser->file->indent))
+        return syntax_error(parser, scope, &token->location,
+          "syntax error, bad indent");
+      if (newline && in_scope(parser, scope, parser->file->indent) != 0)
+        return semantic_error(parser, scope, &token->location,
+          "syntax error, bad indent");
+      scope_t enclosed = { scope, 0, parser->file->tokens.last - 1, token->option };
       if ((code = parse_suboption(parser, &enclosed)) < 0)
         return code;
-      // suboptions follow (optional) literals
+      // suboptions follow (optional) values
       state &= ~((1 << OPTION) | (1 << VALUE));
     } else if (code == VALUE || code == QUOTED_VALUE) {
       if (!(state & (1 << VALUE)))
-        return syntax_error(parser, scope, token, "unexpected literal");
+        return semantic_error(parser, scope, &token->location,
+          "unexpected literal");
       if (newline && !in_scope(parser, scope, parser->file->indent))
-        return syntax_error(parser, scope, token, "scope did not match");
+        return semantic_error(parser, scope, &token->location,
+          "scope did not match");
       if ((code = accept(parser, scope, token)) < 0)
         return code;
       state &= ~(1 << OPTION);
@@ -582,7 +734,7 @@ static int32_t parse_section(parser_t *parser, scope_t *scope)
   int32_t code, state = 0;
   token_t *token;
 
-  if ((code = enter_scope(parser, scope)) < 0)
+  if ((code = enter(parser, scope)) < 0)
     return code;
 
   for (;;) {
@@ -591,7 +743,7 @@ static int32_t parse_section(parser_t *parser, scope_t *scope)
 
     if (code == END_OF_FILE) {
       unshift(parser);
-      return exit_scope(parser, scope);
+      return leave(parser, scope);
     } else if (code == SPACE) {
       if (indent) {
         parser->file->indent = parser->file->tokens.size - 1;
@@ -604,25 +756,36 @@ static int32_t parse_section(parser_t *parser, scope_t *scope)
         reduce(parser);
       state |= (1 << OPTION);
       parser->file->indent = 0;
-    } else if (code == OPTION || code == SECTION) {
+    } else if (code == OPTION || code == SECTION || code == INCLUDE) {
       assert(token && token->option);
-      if (!in_options(scope->option, token->option))
-        return exit_scope(parser, scope);
-
+      // FIXME: not quite right, because the scope must match!
       if (!scope->indent)
         scope->indent = parser->file->indent;
-      else if (!in_scope(parser, scope, parser->file->indent))
-        return syntax_error(parser, scope, token, "syntax error");
+      if (!is_indent(parser, scope, parser->file->indent))
+        return syntax_error(parser, scope, &token->location,
+          "syntax error, invalid indentation");
 
-      scope_t enclosed = { scope, 0, 0, token->option };
+      switch (in_scope(parser, scope, parser->file->indent)) {
+        case  1: // option defined in enclosing scope
+          unshift(parser);
+          return leave(parser, scope);
+        case -1: // option defined in enclosed scope, impossible
+          return syntax_error(parser, scope, &token->location,
+            "syntax error, invalid indentation");
+      }
+
+      scope_t enclosed = { scope, 0, parser->file->tokens.last - 1, token->option };
       if (code == OPTION)
         code = parse_option(parser, &enclosed);
-      else
+      else if (code == SECTION)
         code = parse_section(parser, &enclosed);
+      else
+        code = parse_include(parser, &enclosed);
       if (code < 0)
         return code;
     } else if (code != COMMENT) {
-      return syntax_error(parser, scope, token, "syntax error");
+      return syntax_error(parser, scope, &token->location,
+        "syntax error");
     }
 
     indent = (code == LINE_FEED);
@@ -630,22 +793,32 @@ static int32_t parse_section(parser_t *parser, scope_t *scope)
   }
 }
 
-static int32_t parse_file(parser_t *parser, const scope_t *scope)
+static int32_t parse_file(parser_t *parser, scope_t *scope)
 {
-  bool indent = false;
-  int32_t code;
-  const int32_t state = (1 << OPTION);
-  token_t *token;
+  file_t *file = parser->file;
 
-  if ((code = enter_scope(parser, scope)) < 0)
-    return code;
+  file->location.file = file->name;
+  file->location.line = 1;
+  file->location.column = 1;
+
+  if (!(parser->file->tokens.data = malloc(sizeof(*parser->file->tokens.data) * 64)))
+    return OUT_OF_MEMORY;
+  // file scope indentation token (no indentation)
+  file->tokens.data[0] = (token_t){SPACE, file->location, 0, 0, NULL};
+  file->tokens.capacity = 64;
+  file->tokens.last = file->tokens.size = 1;
+  file->indent = 0;
+
+  bool indent = false;
+  int32_t code, state = (1 << OPTION);
+  token_t *token;
 
   for (;;) {
     if ((code = shift(parser, scope, state, &token)) < 0)
       return code;
 
     if (code == END_OF_FILE) {
-      return exit_scope(parser, scope);
+      return leave(parser, scope);
     } else if (code == SPACE) {
       if (indent) {
         parser->file->indent = parser->file->tokens.size - 1;
@@ -657,10 +830,11 @@ static int32_t parse_file(parser_t *parser, const scope_t *scope)
       assert(parser->file->tokens.size > 1);
       parser->file->indent = 0;
     } else if (code == OPTION || code == SECTION) {
-      if (parser->file->indent)
-        return syntax_error(parser, scope, token, "syntax error");
       assert(token && token->option);
-      scope_t enclosed = { scope, 0, parser->file->tokens.size - 1, token->option };
+      if (parser->file->indent)
+        return semantic_error(parser, scope, &token->location,
+          "syntax error");
+      scope_t enclosed = { scope, 0, parser->file->tokens.last - 1, token->option };
       if (code == OPTION)
         code = parse_option(parser, &enclosed);
       else
@@ -668,7 +842,8 @@ static int32_t parse_file(parser_t *parser, const scope_t *scope)
       if (code < 0)
         return code;
     } else if (code != COMMENT) {
-      return syntax_error(parser, scope, token, "syntax error");
+      return semantic_error(parser, scope, &token->location,
+        "syntax error");
     }
 
     indent = (code == LINE_FEED);
@@ -676,45 +851,151 @@ static int32_t parse_file(parser_t *parser, const scope_t *scope)
   }
 }
 
-#if 0
-static int32_t include_file(parser_t *parser, scope_t *scope)
+static char *resolve_path(const char *file)
 {
-  // implement
+  return strdup(file); // implement properly
 }
-#endif
 
-static int32_t parse(parser_t *parser, void *user_data)
+nonnull_all
+static void close_file(maybe_unused parser_t *parser, file_t *file)
 {
-  file_t *file = parser->file;
-  const option_t option = { SECTION, { 0, NULL }, parser->options, 0, 0, 0 };
-  const scope_t scope = { NULL, 0, 0, &option };
+  assert((file->name == not_a_file) == (file->path == not_a_file));
+  assert((file->name != not_a_file) || (file->handle == NULL));
 
-  (void)user_data;
+  const bool is_file = file->name && file->name != not_a_file;
 
-  if (!(file->tokens.data = malloc(sizeof(*file->tokens.data) * 64)))
-    return OUT_OF_MEMORY;
-  // file scope indentation token (no indentation)
-  file->tokens.data[0] = (token_t){ SPACE, { file->name, {1, 1}, {1, 1} }, 0, 0, NULL };
-  file->tokens.capacity = 64;
-  file->tokens.offset = file->tokens.size = 1;
-
-  file->position.line = 1;
-  file->position.column = 1;
-
-  file->indent = 0;
-  file->escape = 0;
-
-  int32_t code = parse_file(parser, &scope);
-
+  if (file->name != not_a_file)
+    free(file->name);
+  if (file->path != not_a_file)
+    free(file->path);
+  if (file->handle)
+    (void)fclose(file->handle);
+  if (is_file)
+    free(file->buffer.data);
   free(file->tokens.data);
+}
+
+nonnull_all
+static void close_files(parser_t *parser)
+{
+  for (file_t *file = parser->file, *includer; file; file = includer) {
+    includer = file->includer;
+    close_file(parser, file);
+    if (file != &parser->first)
+      free(file);
+  }
+}
+
+nodiscard nonnull_all
+static int32_t open_file(
+  maybe_unused parser_t *parser, file_t *file, const char *name)
+{
+  memset(file, 0, sizeof(*file));
+
+  if (!(file->name = strdup(name)))
+    return OUT_OF_MEMORY;
+  if (!(file->path = resolve_path(file->name)))
+    switch (errno) {
+      case ENOMEM: return OUT_OF_MEMORY;
+      default:     return NO_SUCH_FILE;
+    }
+  if (!(file->handle = fopen(file->name, "rb")))
+    switch (errno) {
+      case ENOMEM: return OUT_OF_MEMORY;
+      case EACCES: return NO_ACCESS;
+      default:     return NO_SUCH_FILE;
+    }
+
+  return 0;
+}
+
+int32_t parse_options_file(
+  const option_t *options,
+  size_t count,
+  const char *file,
+  maybe_unused void *user_data)
+{
+  int32_t code;
+  parser_t parser = { 0 };
+
+  if ((code = open_file(&parser, &parser.first, file)) < 0)
+    return code;
+
+  parser.file = &parser.first;
+  parser.options.data = options;
+  parser.options.size = count;
+
+  const option_t option = { SECTION, { 0, NULL }, { count, options }, 0, 0, 0 };
+  scope_t scope = { NULL, 0, 0, &option };
+
+  code = parse_file(&parser, &scope);
+  close_files(&parser);
   return code;
 }
 
-int32_t parse_options_string(
-  const option_tuple_t *options,
+static int32_t include_file(
+  parser_t *parser, scope_t *scope, const char *filename)
+{
+  int32_t code;
+  file_t *file, *includer;
+
+  if (!(file = calloc(1, sizeof(*file))))
+    return OUT_OF_MEMORY;
+  file->includer = includer = parser->file;
+  parser->file = file;
+
+  if ((code = open_file(parser, file, filename)) < 0)
+    return code;
+location_t location = { "dummy", 1, 1 };
+  for (uint32_t depth = 1; includer; depth++, includer = includer->includer) {
+    if (strcmp(file->path, includer->path) == 0)
+      return semantic_error(parser, scope, &location,
+        "circular include in %s", file->name);
+    // check if include limit is not exceeded
+    //if (depth > parser->include_limit)
+  }
+
+  assert(scope->encloser->option && scope->encloser->option->code == SECTION);
+
+  const option_t option = { SECTION, { 0, NULL }, scope->option->options, 0, 0, 0 };
+  scope_t enclosed = { NULL, 0, 0, &option };
+
+  code = parse_file(parser, &enclosed);
+  parser->file = file->includer;
+  close_file(parser, file);
+  return code;
+}
+
+static int32_t include_filespec(
+  parser_t *parser, scope_t *scope, const char *filespec)
+{
+  int32_t code;
+  find_handle_t *handle = NULL;
+  find_data_t data;
+
+  if ((code = find_file(&handle, filespec, &data)) < 0)
+    return code;
+
+  while (code > 0) {
+    if (data.type == 1 && (code = include_file(parser, scope, data.name)) < 0) {
+      break;
+    }
+    if ((code = find_next_file(handle, &data)) < 0) {
+      // FIXME: print error
+      break;
+    }
+  }
+
+  find_close(handle);
+  return code;
+}
+
+int32_t parse_options(
+  const option_t *options,
+  size_t count,
   const char *string,
   size_t length,
-  void *user_data)
+  maybe_unused void *user_data)
 {
   parser_t parser = { 0 };
 
@@ -723,9 +1004,15 @@ int32_t parse_options_string(
   parser.file->name = not_a_file;
   parser.file->path = not_a_file;
   parser.file->handle = NULL;
-  parser.file->buffer.data.read = string;
+  parser.file->buffer.data = (char *)string;
   parser.file->buffer.size = parser.file->buffer.capacity = length;
-  parser.options = *options;
+  parser.options.data = options;
+  parser.options.size = count;
 
-  return parse(&parser, user_data);
+  const option_t option = { SECTION, { 0, NULL }, { count, options }, 0, 0, 0 };
+  scope_t scope = { NULL, 0, 0, &option };
+
+  const int32_t code = parse_file(&parser, &scope);
+  close_files(&parser);
+  return code;
 }

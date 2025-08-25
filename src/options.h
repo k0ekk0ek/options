@@ -14,22 +14,17 @@
 
 #include "errors.h"
 
-typedef struct position position_t;
-struct position {
-  size_t line, column;
-};
-
 typedef struct location location_t;
 struct location {
   const char *file;
-  position_t begin, end;
+  size_t line, column;
 };
 
 typedef struct lexeme lexeme_t;
 struct lexeme {
   location_t location;
   struct {
-    size_t length;
+    size_t size;
     const char *data;
   } string;
 };
@@ -38,8 +33,8 @@ typedef struct option option_t;
 struct option;
 
 typedef int32_t(*enter_t)(
-  const option_t *, const lexeme_t *, void *);
-typedef int32_t(*exit_t)(
+  const option_t *, const lexeme_t *key, void *user_data);
+typedef int32_t(*leave_t)(
   const option_t *, const lexeme_t *, void *);
 typedef int32_t(*accept_t)(
   const option_t *, const lexeme_t *, void *);
@@ -55,7 +50,7 @@ struct option {
   int32_t code;
   /** Pattern to match identifiers */
   struct {
-    size_t length;
+    size_t size;
     const char *data;
   } pattern;
   option_tuple_t options;
@@ -65,7 +60,7 @@ struct option {
   /** Callback invoked when scope is entered */
   enter_t enter;
   /** Callback invoked when scope is exited */
-  exit_t exit;
+  leave_t exit;
   /** Callback invoked to accept value */
   accept_t accept;
 };
@@ -99,9 +94,20 @@ struct option {
 //   option: value
 //
 
+// parser options
+//   include limit
+//   allow includes
+//   log callback
 
-int32_t parse_options_string(
-  const option_tuple_t *options,
+int32_t parse_options_file(
+  const option_t *options,
+  size_t count,
+  const char *file,
+  void *user_data);
+
+int32_t parse_options(
+  const option_t *options,
+  size_t count,
   const char *string,
   size_t length,
   void *user_data);
