@@ -299,7 +299,7 @@ static const option_t *is_option(
     assert(scope->indent);
     outer = &parser->file->tokens.data[scope->indent];
     assert(outer->code == SPACE);
-    if (outer->size < inner->size)
+    if (outer->size <= inner->size)
       return !memcmp(data+outer->size, data+inner->size, outer->size)
         ? has_option(scope->option, name, size) : NULL;
   }
@@ -493,7 +493,7 @@ static int32_t scan(
 
 nodiscard nonnull_all
 static never_inline int32_t shift(
-  parser_t *parser, const scope_t *scope, const int32_t state, token_t **token)
+  parser_t *parser, const scope_t *scope, const int32_t state, size_t *token)
 {
   assert(parser->file->tokens.last > 0);
   assert(parser->file->tokens.size > 0);
@@ -516,8 +516,7 @@ static never_inline int32_t shift(
   }
 
   assert(parser->file->tokens.last < parser->file->tokens.size);
-  *token = &parser->file->tokens.data[ parser->file->tokens.last++ ];
-  return (*token)->code;
+  return parser->file->tokens.data[(*token = parser->file->tokens.last++)].code;
 }
 
 nonnull_all
@@ -528,19 +527,23 @@ static never_inline void unshift(parser_t *parser)
   parser->file->tokens.last--;
 }
 
-nonnull_all
-static never_inline void reduce(parser_t *parser)
+nonnull((1))
+static never_inline void reduce(parser_t *parser, size_t token)
 {
   assert(parser->file->tokens.last > 1);
   assert(parser->file->tokens.last <= parser->file->tokens.size);
+  assert(token > 0 && token < parser->file->tokens.last);
 
   // retain unshifted tokens
-  const size_t move = parser->file->tokens.size - parser->file->tokens.last;
+  const size_t move = parser->file->tokens.size - token;
   memmove(
-    parser->file->tokens.data + (parser->file->tokens.last - 1),
-    parser->file->tokens.data + (parser->file->tokens.last),
+    parser->file->tokens.data + (token),
+    parser->file->tokens.data + (token + 1),
     move * sizeof(*parser->file->tokens.data));
 
+  assert(parser->file->indent != token);
+  if (parser->file->indent > token)
+    parser->file->indent--;
   parser->file->tokens.last--;
   parser->file->tokens.size--;
 }
@@ -594,7 +597,7 @@ nodiscard nonnull_all
 static int32_t parse_suboption(parser_t *parser, scope_t *scope)
 {
   int32_t code, state = (1 << VALUE);
-  token_t *token;
+  size_t token;
 
   if ((code = enter(parser, scope)) < 0)
     return code;
@@ -603,9 +606,9 @@ static int32_t parse_suboption(parser_t *parser, scope_t *scope)
 
   if (code == LINE_FEED) {
     if (parser->file->indent > scope->indent)
-      reduce(parser);
+      reduce(parser, token);
   } else if (code == VALUE || code == QUOTED_VALUE) {
-    if ((code = accept(parser, scope, token)) < 0)
+    if ((code = accept(parser, scope, &parser->file->tokens.data[token])) < 0)
       return code;
   }
 
@@ -618,45 +621,46 @@ static int32_t include_filespec(
 static int32_t parse_include(parser_t *parser, scope_t *scope)
 {
   int32_t code;
-  token_t *token;
+  size_t token;
 
   if ((code = shift(parser, scope, 0, &token)) < 0)
     return code;
   // accept space between include: and file name
   if (code == SPACE) {
-    reduce(parser);
+    reduce(parser, token);
     if ((code = shift(parser, scope, 0, &token)) < 0)
       return code;
   }
 
   if (code != VALUE && code != QUOTED_VALUE)
-    return semantic_error(parser, scope, &token->location,
+    return semantic_error(parser, scope, &parser->file->tokens.data[token].location,
       "include: directive takes a file name");
 
-  const token_t *file = token;
+  const size_t file = token;
 
   // accept space and comment after file name
   if ((code = shift(parser, scope, 0, &token)) < 0)
     return code;
   if (code == SPACE) {
-    reduce(parser);
+    reduce(parser, token);
     if ((code = shift(parser, scope, 0, &token)) < 0)
       return code;
   }
   if (code == COMMENT) {
-    reduce(parser);
+    reduce(parser, token);
     if ((code = shift(parser, scope, 0, &token)) < 0)
       return code;
   }
 
   if (code != LINE_FEED && code != END_OF_FILE)
-    return semantic_error(parser, scope, &token->location,
+    return semantic_error(parser, scope, &parser->file->tokens.data[token].location,
       "include: directive takes only a file name");
   else
     unshift(parser);
 
   char *filespec;
-  if (!(filespec = strndup(&parser->file->buffer.data[file->first], file->size)))
+  const token_t *x = &parser->file->tokens.data[file];
+  if (!(filespec = strndup(&parser->file->buffer.data[x->first], x->size)))
     return OUT_OF_MEMORY;
 
   code = include_filespec(parser, scope, filespec);
@@ -668,8 +672,9 @@ static int32_t parse_option(parser_t *parser, scope_t *scope)
 {
   bool indent = false, newline = false;
   int32_t code, state = (1 << SUBOPTION) | (1 << VALUE);
-  token_t *token;
+  size_t token;
 
+  assert(scope->encloser);
   if ((code = enter(parser, scope)) < 0)
     return code;
 
@@ -682,7 +687,7 @@ static int32_t parse_option(parser_t *parser, scope_t *scope)
       return leave(parser, scope);
     } else if (code == SPACE) {
       if (indent) {
-        if (!scope->indent)
+        if (!scope->indent && in_scope(parser, scope->encloser, parser->file->tokens.size-1) == -1)
           scope->indent = parser->file->tokens.size - 1;
         parser->file->indent = parser->file->tokens.size - 1;
         continue; // retain indentation
@@ -691,39 +696,37 @@ static int32_t parse_option(parser_t *parser, scope_t *scope)
       // discard indentation unless it dictates scope
       if (scope->indent < parser->file->indent &&
           scope->indent > scope->encloser->indent)
-        reduce(parser);
+        reduce(parser, scope->indent);
       state |= (1 << OPTION);
       newline = true;
       parser->file->indent = 0;
     } else if (code == SUBOPTION) {
-      if (!scope->indent)
-        scope->indent = parser->file->indent;
       if (newline && !is_indent(parser, scope, parser->file->indent))
-        return syntax_error(parser, scope, &token->location,
+        return syntax_error(parser, scope, &parser->file->tokens.data[token].location,
           "syntax error, bad indent");
       if (newline && in_scope(parser, scope, parser->file->indent) != 0)
-        return semantic_error(parser, scope, &token->location,
+        return semantic_error(parser, scope, &parser->file->tokens.data[token].location,
           "syntax error, bad indent");
-      scope_t enclosed = { scope, 0, parser->file->tokens.last - 1, token->option };
+      scope_t enclosed = { scope, 0, token, parser->file->tokens.data[token].option };
       if ((code = parse_suboption(parser, &enclosed)) < 0)
         return code;
       // suboptions follow (optional) values
       state &= ~((1 << OPTION) | (1 << VALUE));
     } else if (code == VALUE || code == QUOTED_VALUE) {
       if (!(state & (1 << VALUE)))
-        return semantic_error(parser, scope, &token->location,
+        return semantic_error(parser, scope, &parser->file->tokens.data[token].location,
           "unexpected literal");
       if (newline && !in_scope(parser, scope, parser->file->indent))
-        return semantic_error(parser, scope, &token->location,
+        return semantic_error(parser, scope, &parser->file->tokens.data[token].location,
           "scope did not match");
-      if ((code = accept(parser, scope, token)) < 0)
+      if ((code = accept(parser, scope, &parser->file->tokens.data[token])) < 0)
         return code;
       state &= ~(1 << OPTION);
     } else {
       assert(code == COMMENT);
     }
 
-    reduce(parser);
+    reduce(parser, token);
     indent = (code == LINE_FEED);
   }
 }
@@ -732,8 +735,9 @@ static int32_t parse_section(parser_t *parser, scope_t *scope)
 {
   bool indent = false;
   int32_t code, state = 0;
-  token_t *token;
+  size_t token;
 
+  assert(scope->encloser);
   if ((code = enter(parser, scope)) < 0)
     return code;
 
@@ -746,23 +750,21 @@ static int32_t parse_section(parser_t *parser, scope_t *scope)
       return leave(parser, scope);
     } else if (code == SPACE) {
       if (indent) {
-        parser->file->indent = parser->file->tokens.size - 1;
+        if (!scope->indent && in_scope(parser, scope->encloser, token) == -1)
+          scope->indent = token;
+        parser->file->indent = token;
         continue; // retain indentation
       }
     } else if (code == LINE_FEED) {
       // reduce indent unless it determines (parent) scope
       if (parser->file->indent > scope->indent &&
           parser->file->indent > scope->encloser->indent)
-        reduce(parser);
+        reduce(parser, parser->file->indent);
       state |= (1 << OPTION);
       parser->file->indent = 0;
     } else if (code == OPTION || code == SECTION || code == INCLUDE) {
-      assert(token && token->option);
-      // FIXME: not quite right, because the scope must match!
-      if (!scope->indent)
-        scope->indent = parser->file->indent;
       if (!is_indent(parser, scope, parser->file->indent))
-        return syntax_error(parser, scope, &token->location,
+        return syntax_error(parser, scope, &parser->file->tokens.data[token].location,
           "syntax error, invalid indentation");
 
       switch (in_scope(parser, scope, parser->file->indent)) {
@@ -770,11 +772,11 @@ static int32_t parse_section(parser_t *parser, scope_t *scope)
           unshift(parser);
           return leave(parser, scope);
         case -1: // option defined in enclosed scope, impossible
-          return syntax_error(parser, scope, &token->location,
+          return syntax_error(parser, scope, &parser->file->tokens.data[token].location,
             "syntax error, invalid indentation");
       }
 
-      scope_t enclosed = { scope, 0, parser->file->tokens.last - 1, token->option };
+      scope_t enclosed = { scope, 0, token, parser->file->tokens.data[token].option };
       if (code == OPTION)
         code = parse_option(parser, &enclosed);
       else if (code == SECTION)
@@ -784,12 +786,12 @@ static int32_t parse_section(parser_t *parser, scope_t *scope)
       if (code < 0)
         return code;
     } else if (code != COMMENT) {
-      return syntax_error(parser, scope, &token->location,
+      return syntax_error(parser, scope, &parser->file->tokens.data[token].location,
         "syntax error");
     }
 
     indent = (code == LINE_FEED);
-    reduce(parser);
+    reduce(parser, token);
   }
 }
 
@@ -811,7 +813,7 @@ static int32_t parse_file(parser_t *parser, scope_t *scope)
 
   bool indent = false;
   int32_t code, state = (1 << OPTION);
-  token_t *token;
+  size_t token;
 
   for (;;) {
     if ((code = shift(parser, scope, state, &token)) < 0)
@@ -821,20 +823,19 @@ static int32_t parse_file(parser_t *parser, scope_t *scope)
       return leave(parser, scope);
     } else if (code == SPACE) {
       if (indent) {
-        parser->file->indent = parser->file->tokens.size - 1;
+        parser->file->indent = token;
         continue; // retain indentation
       }
     } else if (code == LINE_FEED) {
-      if (parser->file->indent > scope->indent)
-        reduce(parser);
+      if (parser->file->indent)
+        reduce(parser, parser->file->indent);
       assert(parser->file->tokens.size > 1);
       parser->file->indent = 0;
     } else if (code == OPTION || code == SECTION) {
-      assert(token && token->option);
       if (parser->file->indent)
-        return semantic_error(parser, scope, &token->location,
+        return semantic_error(parser, scope, &parser->file->tokens.data[token].location,
           "syntax error");
-      scope_t enclosed = { scope, 0, parser->file->tokens.last - 1, token->option };
+      scope_t enclosed = { scope, 0, token, parser->file->tokens.data[token].option };
       if (code == OPTION)
         code = parse_option(parser, &enclosed);
       else
@@ -842,12 +843,12 @@ static int32_t parse_file(parser_t *parser, scope_t *scope)
       if (code < 0)
         return code;
     } else if (code != COMMENT) {
-      return semantic_error(parser, scope, &token->location,
+      return semantic_error(parser, scope, &parser->file->tokens.data[token].location,
         "syntax error");
     }
 
     indent = (code == LINE_FEED);
-    reduce(parser);
+    reduce(parser, token);
   }
 }
 
