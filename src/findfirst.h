@@ -8,8 +8,8 @@
 #ifndef FINDFIRST_H
 #define FINDFIRST_H
 
-// Porting glob to Windows is more complicated than implementing _findfirst,
-// which should provide a sufficiently sophisticated solution.
+// Porting glob to Windows is more complicated than implementing _findfirst
+// for POSIX, which should provide a sufficiently sophisticated solution.
 
 #include <stddef.h>
 #include <stdint.h>
